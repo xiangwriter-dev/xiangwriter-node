@@ -1,0 +1,184 @@
+﻿========================================================
+ xiangwriter-node（想写）— AI 漫剧批量生成插件 使用说明
+========================================================
+
+【一、环境要求】
+1. ComfyUI 版本：0.30.0 及以上（插件自动适配 V3/V1 两套节点接口，新旧版本通用）
+2. 插件安装位置：
+   ComfyUI/custom_nodes/xiangwriter-node
+   把整个 xiangwriter-node 文件夹复制到 ComfyUI 安装目录的 custom_nodes
+   文件夹里，然后重启 ComfyUI
+3. 无需安装任何额外 Python 依赖（只使用 Python 标准库 + ComfyUI 自带的库）
+4. 可选但推荐：一个 LLM API 密钥（OpenAI 兼容接口，见【五】），
+   用于 agent 智能匹配参考图、生成提示词、规划忽略节点；
+   不配置也能用（按文件名顺序自动加载，纯手工模式）
+5. 新旧 ComfyUI 前端均兼容：旧版 graph.links 普通对象与新版 Map 连线结构
+   都能自动追踪未使用图片分支。更完整的发布/运行条件见 环境要求.txt
+
+【二、目录结构约定】
+系列根目录下放集目录（一集 1~2 分钟），因为视频生成只支持 15 秒/段，
+所以一集要切成多段：每集目录下放 1-1、1-2、1-3... 段目录，
+每段目录里放【本段的】剧本 + 参考图：
+
+    D:/漫剧/目录1/                  <- 系列根目录（节点的 root_dir 填这个）
+    ├── 第一集/                     <- 集目录
+    │   ├── 1-1/                    <- 段目录（每段 ≤15 秒视频）
+    │   │   ├── 剧本.txt            <- 本段剧本（UTF-8 或 GBK 都能读）
+    │   │   ├── 角色A.png           <- 本段参考图（数量不限，一集最多用 9 张）
+    │   │   └── 场景1.png
+    │   ├── 1-2/
+    │   │   ├── 剧本.txt
+    │   │   └── ...
+    │   └── 1-3/ ...
+    ├── 第二集/
+    │   ├── 1-1/ ...
+    │   └── 1-2/ ...
+    └── 第三集/ ...
+
+说明：
+- 集目录、段目录都按"自然排序"识别（第2集 < 第10集；1-2 < 1-10）
+- 也可以不用分段（整集模式）：每集目录里直接放剧本 + 参考图，
+  把节点的 segment_mode 关掉即可
+- 参考图文件名建议带上角色/场景名（如 主角.png、教室.png），
+  这样纯文本 LLM 也能正确判断每张图的用途
+- image_pattern 默认只匹配 *.png；有 jpg 就填 *.png,*.jpg
+
+【三、工作流搭建】
+推荐的新工作流由三个批处理节点组成：
+  ①「想写·剧集素材读取」XWSeriesSource
+      负责 root_dir、集/段选择、读取剧本与参考图清单
+  ②「想写·Agent 规划」XWAgentPlanner
+      source_json 接①；输出 plan 和 prompt。不配 LLM 也会正常输出顺序方案
+  ③「想写·参考图槽位加载」XWReferenceLoader
+      source_json 接①、plan 接②；输出 image_1 ~ image_9 和 images_batch
+
+模块化接线：
+  ① source_json -> ② source_json
+  ① source_json -> ③ source_json
+  ② plan        -> ③ plan
+  ② prompt      -> CLIPTextEncode 等提示词节点
+  ③ image_1...  -> IPAdapter / ControlNet / 图生图链路
+
+原来的「漫剧导演」XWComicDirector 一体节点继续保留，旧工作流无需重做。
+模块化流程也支持画布按钮自动 bypass 和逐集连播：按钮位于①「剧集素材读取」上，
+分析结果会写入相连②「Agent 规划」的“预设规划”，并控制相连③加载器的图片分支。
+
+一体节点搭建：
+1. 右键画布 -> 搜索 xiangwriter-node -> 添加「漫剧导演」节点
+   （菜单分类：xiangwriter-node/漫剧）
+2. 接线：
+   - image_1 ~ image_9（IMAGE 类型）-> 接到 ControlNet / IPAdapter /
+     图生图等任何需要参考图的输入端（和 LoadImage 的输出完全一样，
+     节点运行后还会直接在节点上显示参考图预览）
+   - images_batch（IMAGE 批量）-> 可选，给支持批量输入的节点用
+   - script / agent_prompt（STRING 类型）-> 提示词：
+     先在 CLIPTextEncode 节点上右键 text -> Convert widget to input
+     （转成输入端口），再把线接过去
+   - episode_name / segment_name -> 可选，接文件名类节点，用于按集/段保存结果
+   - duration_seconds（FLOAT，界面显示“场景时长(秒)”）-> 接需要浮点秒数的视频节点；
+     例如剧本标题中的“约 8秒”会输出 8.0
+3. 工作流里必须有一个输出节点（Save Image / Preview Image），否则无法运行
+
+【四、节点参数说明】
+  root_dir          系列根目录，如 D:/漫剧/目录1（必填）
+  episode_index     从第几集开始，默认 1
+  segment_mode      分段模式开关：
+                    开 = 集下面还有 1-1/1-2... 段目录（每段 15 秒视频）
+                    关 = 整集模式（每集目录直接放剧本和参考图）
+  segment_index     当前第几段，默认 1
+  script_file       剧本文件名，默认 剧本.txt
+  image_pattern     参考图匹配，默认 *.png；混合格式写 *.png,*.jpg
+  max_images        一集最多用几张参考图，默认 9
+  plan              agent 规划结果（JSON），点按钮自动生成，不用手填
+  llm_api_base      LLM 接口地址，见【五】
+  llm_api_key       LLM 密钥（留空 = 不用 agent，按文件名顺序加载）
+  llm_model         LLM 模型名
+  llm_vision        开 = 把参考图发给模型"看图"（需多模态模型）；
+                    关 = 只发文件名给模型
+  llm_system_prompt 自定义 agent 提示词（留空用内置模板）
+  prompt_target     工作流里提示词节点的标题，如 CLIP Text Encode (Prompt)
+                    （填了之后，运行时会自动把剧本/提示词写进该节点）
+  prompt_widget     提示词节点的参数名，默认 text
+
+场景时长输出：
+  duration_seconds   当前场景明确标注的时长，统一换算成浮点秒数并保留小数
+
+说明：Agent 会在同一次选图分析中识别“约8秒”“持续10秒”“1.5分钟”等标注，
+并把原文 duration_text 和换算后的 duration_seconds 写进 plan。插件会验证原文标注，
+以剧本中的数值为准；没有明确标注时输出 0，不会根据对白长度自行估算。
+未配置 LLM 或调用失败时，本地规则仍能识别常见的秒、分钟格式。
+
+【五、LLM 环境配置（OpenAI 兼容接口）】
+在节点的 llm_api_base / llm_api_key / llm_model 三个参数里填：
+
+  安全建议：也可以在启动 ComfyUI 前设置 XW_LLM_BASE、XW_LLM_KEY、
+            XW_LLM_MODEL 环境变量，然后让节点里的三个输入保持空白，
+            这样密钥不会写入工作流 JSON。
+
+  DeepSeek  接口地址  https://api.deepseek.com/v1
+            模型      deepseek-chat（纯文本，不开 llm_vision）
+  OpenAI    接口地址  https://api.openai.com/v1
+            模型      gpt-4o（多模态，可开 llm_vision）
+  通义千问  接口地址  https://dashscope.aliyuncs.com/compatible-mode/v1
+            模型      qwen-vl-max（多模态，可开 llm_vision）
+  本地 Ollama（免费）
+            接口地址  http://127.0.0.1:11434/v1
+            模型      qwen2.5vl 等（先下载模型并启动 ollama serve）
+  其它      任何 OpenAI 兼容服务都行，只要填对接口地址和模型名
+
+不开 llm_vision 时：agent 只读剧本 + 参考图文件名，按剧情理解分配；
+开 llm_vision 时：参考图会压缩到最长边 1024px 的 JPEG 发给模型，看得更准。
+
+【六、运行方式（节点上的 4 个按钮）】
+  一体工作流在「漫剧导演」节点操作；模块工作流在「剧集素材读取」节点操作。
+  🔍 分析当前段/集（agent）  只分析：读剧本 + 看图 -> 生成槽位规划 JSON，
+                             写入 plan 文本框（可先检查它选了哪几张图）
+  ▶ 运行当前段/集            分析 -> 把提示词写入提示词节点 -> 自动忽略
+                             多余的下游节点 -> 入队运行当前段/集
+  ⏭ 连播剩余全部（段/集）    分段模式：段跑完自动进下一段，段跑完进下一集；
+                             整集模式：逐集推进；全部跑完自动停止
+  ⏸ 停止连播                 中断连播
+
+"忽略节点"怎么生效：
+  插件不再只依赖 LLM 猜节点标题。分析得到本段实际图片槽位后，会从未使用的
+  image_1 ~ image_9 输出连线开始，自动追踪对应的下游独占链路；运行前把这些
+   节点设为 bypass（跳过不执行，节点变灰色）。规则是 n 张图变成 n-1 张图，
+   n 为 1～9 的整数，支持 9->8、8->7……1->0。进入下一段时保留前 n-1 路，
+   自动忽略新减少的第 n 路及本来就为空的更高槽位。用户原本手工 bypass 的节点不会
+   被错误恢复。KJNodes Use Everywhere 的 SetNode 可随缺图槽位跳过，但 GetNode
+   保持启用并由其扩展安全解析，避免切断公共生成链。保存图像、预览图像、
+   视频合成等输出节点不会被自动跳过。LLM 返回的 ignored
+   节点仍会作为附加规则使用，但其中的输出节点会被安全过滤。
+
+剧本自动加载到提示词窗口：
+  在 prompt_target 填提示词节点的标题后，点运行时剧本/agent 提示词会
+  自动写入该节点的 text 输入框，不需要手动复制粘贴。
+
+【七、无头批量模式（可选，不用浏览器）】
+  在 ComfyUI 菜单导出工作流的 API 格式 JSON（Save (API Format)），然后命令行：
+    python scripts/run_series.py --workflow 工作流API.json --root "D:/漫剧/目录1" ^
+        --segment-mode --llm-base https://api.deepseek.com/v1 ^
+        --llm-key sk-xxx --llm-model deepseek-chat
+  --segment-mode 会按 每集下的 1-1/1-2... 段目录 逐段生成（段内再切到下一段）。
+  API 工作流既可以包含 XWComicDirector，也可以使用
+  XWSeriesSource + XWReferenceLoader（XWAgentPlanner 可选）的模块组合。
+  逐段流程：agent 分析 -> 更新导演节点 -> 切除未用槽位链路（等效忽略）
+  -> 排队 -> 轮询结果 -> 下一段/下一集。每段历史结果存到 --out 目录。
+
+【八、常见问题】
+1. 搜索不到节点？
+   - 浏览器按 Ctrl+F5 强制刷新（节点列表是页面加载时获取的）
+   - 确认 ComfyUI/custom_nodes/xiangwriter-node 存在
+   - 确认重启过 ComfyUI（不是只刷新网页）
+   - 查看 ComfyUI 控制台日志或 ComfyUI/user/comfyui.log
+2. LLM 调用失败？自动降级为按文件名顺序加载，不会中断工作流。
+3. 手动改了 episode_index / segment_index？请重新点「分析」生成新的 plan
+   （plan 与当前段不符时节点会自动降级为文件名顺序）。
+4. 参考图尺寸不一致（如角色图 512x512、场景图 1024x576）？
+   没问题，逐槽位输出不受影响；批量输出 images_batch 会自动降级为空。
+5. 一段里用不到 9 张图？agent 只加载需要的，空槽位不输出。
+6. 连播中途想停？点「⏸ 停止连播」，或刷新页面。
+7. 出现 Prompt has no outputs？
+   插件入队前会检查输出节点，并恢复旧版本可能误跳过的输出。若仍提示没有输出，
+   说明工作流中的保存图像、预览图像、视频合成节点全部被用户手动设为 bypass；
+   至少手动启用其中一个后再运行。

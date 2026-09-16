@@ -1,0 +1,81 @@
+========================================================
+ xiangwriter-node 环境要求与兼容性说明
+========================================================
+
+一、基础环境
+
+1. ComfyUI：0.30.0 或更高版本。
+2. Python：3.10 或更高版本（跟随 ComfyUI 官方环境，不需要单独更换 Python）。
+3. 操作系统：Windows、Linux、macOS；只要 ComfyUI 本身能够正常运行即可。
+4. 浏览器：使用 ComfyUI 支持的现代 Chrome、Edge 或 Firefox。
+
+二、ComfyUI 节点接口兼容
+
+1. 检测到 comfy_api.latest 时，插件自动注册 V3 节点。
+2. 未检测到 comfy_api.latest 时，插件自动回退到 V1 经典节点。
+3. 不需要用户手动选择 V1 或 V3，节点功能和中文端口名称保持一致。
+
+三、ComfyUI 前端兼容
+
+1. 兼容旧版 LiteGraph 的 graph.links 普通对象结构。
+2. 兼容新版 comfyui_frontend_package 的 graph.links Map 结构。
+3. 自动跳过节点依赖前端扩展：运行前会读取实际使用的图片槽位，追踪未使用
+   image_1～image_9 的下游分支并设置 bypass；图片数量恢复时自动还原。
+4. 已在 ComfyUI 0.30.0、comfyui_frontend_package 1.47.11 环境验证 Map 连线兼容。
+
+四、Python 依赖
+
+插件不要求额外安装第三方依赖。以下组件由 ComfyUI 自带：
+
+- torch
+- numpy
+- Pillow
+- aiohttp
+- typing_extensions（V3 接口环境）
+
+requirements.txt 仅用于说明，无需单独执行 pip install。
+
+五、可选网络与 LLM 环境
+
+1. 不配置 LLM 也能运行，插件会按参考图文件名顺序生成槽位方案。
+2. 使用 Agent 智能选图时，需要可访问 OpenAI 兼容的 chat/completions 接口。
+3. 需要在节点中填写 LLM 接口地址、模型名和 API Key。
+4. 启用多模态看图时，所选模型必须支持图片输入。
+
+六、安装与更新
+
+1. 将整个 xiangwriter-node 文件夹放入：
+   ComfyUI/custom_nodes/xiangwriter-node
+2. 必须完整保留 js、py、scripts 等子目录，不能只复制 Python 文件。
+3. 安装或更新后完全重启 ComfyUI。
+4. 浏览器按 Ctrl+F5 强制刷新，避免继续使用缓存的旧版 director.js。
+5. 如果自动跳过不生效，先检查浏览器控制台是否成功加载：
+   xiangwriter-node/js/director.js
+   xiangwriter-node/js/slot_ignore.js
+
+七、发布到 GitHub
+
+建议仓库根目录直接使用 xiangwriter-node 文件夹内容，并至少保留：
+
+- __init__.py
+- requirements.txt
+- README.md
+- 使用说明.txt
+- 环境要求.txt
+- py/
+- js/
+- scripts/
+- tests/
+
+前端兼容测试命令：
+
+node tests/slot_ignore.test.mjs
+node tests/auto_advance.test.mjs
+
+场景时长输出测试命令：
+
+python tests/test_duration_output.py
+
+Python 语法检查命令：
+
+python -m compileall -q .

@@ -1,0 +1,282 @@
+# -*- coding: utf-8 -*-
+"""XiangWriter æ— å¤´æ‰¹é‡è¿è¡Œå™¨ï¼ˆçº¯ API æ¨¡å¼ï¼Œä¸éœ€è¦æµè§ˆå™¨ï¼Œå…¼å®¹ ComfyUI 0.3.0+ï¼‰ã€‚
+
+ç”¨æ³•ï¼š
+  python run_series.py --workflow å·¥ä½œæµAPI.json --root "D:/æ¼«å‰§/ç›®å½•1" ^
+      [--start 1] [--end 3] [--llm-base http://127.0.0.1:11434/v1] ^
+      [--llm-key sk-xxx] [--llm-model qwen-vl-max] [--no-vision] ^
+      [--server http://127.0.0.1:8188] [--out results]
+
+å…¶ä¸­ å·¥ä½œæµAPI.json æ˜¯ ComfyUI å¯¼å‡ºçš„ API æ ¼å¼å·¥ä½œæµï¼Œå¯ä½¿ç”¨ XWComicDirectorï¼Œ
+ä¹Ÿå¯ä½¿ç”¨ XWSeriesSource + XWReferenceLoader æ¨¡å—ç»„åˆã€‚
+é€é›†æµç¨‹ï¼šagent åˆ†æ -> æ›´æ–°å¯¼æ¼”èŠ‚ç‚¹å‚æ•° -> åˆ‡é™¤æœªç”¨æ§½ä½é“¾è·¯(ç­‰æ•ˆå¿½ç•¥) -> æ’é˜Ÿ -> è½®è¯¢ç»“æœ -> ä¸‹ä¸€é›†ã€‚
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from py import agent as xw_agent  # noqa: E402
+
+DIRECTOR_CLASS = "XWComicDirector"
+SOURCE_CLASS = "XWSeriesSource"
+PLANNER_CLASS = "XWAgentPlanner"
+LOADER_CLASS = "XWReferenceLoader"
+IMAGE_OUTPUTS = 9  # image_1..image_9 çš„è¾“å‡ºç´¢å¼•ä¸º 0..8
+
+
+def http_json(url, data=None, timeout=30):
+    if data is not None:
+        req = urllib.request.Request(
+            url, data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+    else:
+        req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def find_director(workflow):
+    for nid, node in workflow.items():
+        if node.get("class_type") == DIRECTOR_CLASS:
+            return nid, node
+    return None, None
+
+
+def find_class(workflow, class_type):
+    for nid, node in workflow.items():
+        if node.get("class_type") == class_type:
+            return nid, node
+    return None, None
+
+
+def find_xw_nodes(workflow):
+    """ä¼˜å…ˆä½¿ç”¨å…¼å®¹ä¸€ä½“èŠ‚ç‚¹ï¼Œå¦åˆ™è¯†åˆ« Source + Planner + Loader æ¨¡å—ç»„åˆã€‚"""
+    director_id, director = find_director(workflow)
+    source_id, source = find_class(workflow, SOURCE_CLASS)
+    planner_id, planner = find_class(workflow, PLANNER_CLASS)
+    loader_id, loader = find_class(workflow, LOADER_CLASS)
+    if director is not None:
+        return {
+            "mode": "director", "source_id": director_id, "source": director,
+            "planner_id": None, "planner": None,
+            "loader_id": director_id, "loader": director,
+        }
+    if source is not None and loader is not None:
+        return {
+            "mode": "modular", "source_id": source_id, "source": source,
+            "planner_id": planner_id, "planner": planner,
+            "loader_id": loader_id, "loader": loader,
+        }
+    return None
+
+
+def cut_unused_slots(workflow, dir_id, used_slots, log):
+    """æŠŠæœªä½¿ç”¨æ§½ä½çš„è¾“å‡ºé“¾è·¯ä»å·¥ä½œæµä¸­åˆ‡é™¤ï¼›å¤±å»å…¨éƒ¨è¾“å…¥è¿æ¥çš„èŠ‚ç‚¹çº§è”ç§»é™¤ï¼ˆç­‰æ•ˆå¿½ç•¥ï¼‰ã€‚"""
+    doomed = set()
+    for slot in range(1, IMAGE_OUTPUTS + 1):
+        if slot in used_slots:
+            continue
+        for nid, node in list(workflow.items()):
+            if nid == dir_id:
+                continue
+            for iname, ival in list(node.get("inputs", {}).items()):
+                if (isinstance(ival, list) and len(ival) == 2
+                        and ival[0] == dir_id and ival[1] == slot - 1):
+                    del node["inputs"][iname]
+                    doomed.add(nid)
+    changed = True
+    while changed:
+        changed = False
+        for nid in list(doomed):
+            if nid not in workflow or nid == dir_id:
+                doomed.discard(nid)
+                continue
+            log.append("å¿½ç•¥èŠ‚ç‚¹ %s (%s)" % (nid, workflow[nid].get("class_type")))
+            del workflow[nid]
+            doomed.discard(nid)
+            changed = True
+            for nid2, node2 in list(workflow.items()):
+                if nid2 == dir_id:
+                    continue
+                for iname, ival in list(node2.get("inputs", {}).items()):
+                    if isinstance(ival, list) and len(ival) == 2 and ival[0] == nid:
+                        del node2["inputs"][iname]
+                        has_links = any(
+                            isinstance(v, list) and len(v) == 2 and v[0] in workflow
+                            for v in node2.get("inputs", {}).values())
+                        if not has_links:
+                            doomed.add(nid2)
+    return workflow
+
+
+def poll(server, prompt_id, timeout=3600):
+    url = "%s/history/%s" % (server, prompt_id)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            h = http_json(url, timeout=10)
+        except Exception:
+            h = {}
+        if prompt_id in h:
+            st = h[prompt_id].get("status", {})
+            if st.get("completed") or st.get("status_str") == "error":
+                return h[prompt_id]
+        time.sleep(3)
+    raise TimeoutError("ç­‰å¾…æ‰§è¡Œç»“æœè¶…æ—¶: %s" % prompt_id)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="XiangWriter æ— å¤´æ‰¹é‡è¿è¡Œå™¨")
+    ap.add_argument(
+        "--workflow", required=True,
+        help="API æ ¼å¼å·¥ä½œæµ JSONï¼ˆå« XWComicDirector æˆ– Source+Loader æ¨¡å—ç»„åˆï¼‰")
+    ap.add_argument("--root", required=True, help="ç³»åˆ—æ ¹ç›®å½•")
+    ap.add_argument("--start", type=int, default=1)
+    ap.add_argument("--end", type=int, default=0, help="0=å…¨éƒ¨")
+    ap.add_argument("--segment-mode", action="store_true",
+                    help="åˆ†æ®µæ¨¡å¼ï¼šæ¯é›†ä¸‹æŒ‰ 1-1/1-2... å­ç›®å½•é€æ®µç”Ÿæˆï¼ˆæ¯æ®µâ‰ˆ15ç§’è§†é¢‘ï¼‰")
+    ap.add_argument("--script-file", default="å‰§æœ¬.txt")
+    ap.add_argument("--image-pattern", default="*.png")
+    ap.add_argument("--max-images", type=int, default=9)
+    ap.add_argument("--llm-base", default=os.environ.get("XW_LLM_BASE", ""))
+    ap.add_argument("--llm-key", default=os.environ.get("XW_LLM_KEY", ""))
+    ap.add_argument("--llm-model", default=os.environ.get("XW_LLM_MODEL", ""))
+    ap.add_argument("--no-vision", action="store_true")
+    ap.add_argument("--server", default="http://127.0.0.1:8188")
+    ap.add_argument("--out", default="results", help="ç»“æœè¾“å‡ºç›®å½•")
+    args = ap.parse_args()
+
+    with open(args.workflow, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+    xw_nodes = find_xw_nodes(workflow)
+    if xw_nodes is None:
+        print("é”™è¯¯ï¼šå·¥ä½œæµéœ€åŒ…å« XWComicDirectorï¼Œæˆ–åŒæ—¶åŒ…å« XWSeriesSource + XWReferenceLoader")
+        sys.exit(1)
+
+    os.makedirs(args.out, exist_ok=True)
+    ep_dirs = xw_agent.find_episode_dirs(args.root)
+    total = len(ep_dirs)
+    if total == 0:
+        print("é”™è¯¯ï¼š%s ä¸‹æ²¡æœ‰é›†ç›®å½•" % args.root)
+        sys.exit(1)
+    end = args.end if args.end > 0 else total
+
+    for idx in range(args.start, end + 1):
+        ep_dir = ep_dirs[max(0, min(idx - 1, len(ep_dirs) - 1))]
+        ep_name = os.path.basename(ep_dir)
+
+        # ç¡®å®šæœ¬é›†å†…çš„å•ä½ï¼šåˆ†æ®µæ¨¡å¼ -> å„æ®µï¼ˆ1-1,1-2...ï¼‰ï¼›å¦åˆ™æ•´é›†ä¸€ä¸ªå•ä½
+        units = []
+        if args.segment_mode:
+            segs = xw_agent.find_segment_dirs(ep_dir)
+            units = [(s, i + 1) for i, s in enumerate(segs)] if segs else [(ep_dir, 1)]
+        else:
+            units = [(ep_dir, 1)]
+
+        for unit_dir, seg_idx in units:
+            cfg = {
+                "root_dir": args.root,
+                "episode_index": idx,
+                "segment_mode": args.segment_mode,
+                "segment_index": seg_idx,
+                "script_file": args.script_file,
+                "image_pattern": args.image_pattern,
+                "max_images": args.max_images,
+                "nodes": [],
+                "llm": {
+                    "api_base": args.llm_base,
+                    "api_key": args.llm_key,
+                    "model": args.llm_model,
+                    "vision": not args.no_vision,
+                    "system_prompt": "",
+                },
+            }
+            plan = xw_agent.run_agent(cfg)
+            unit_name = plan.get("unit_name") or ep_name
+            print("=" * 60)
+            print("[%d/%d] %s | %s" % (idx, total, unit_name, plan.get("message", "")))
+            if not plan.get("ok"):
+                print("  è·³è¿‡ï¼ˆ%sï¼‰" % plan.get("message"))
+                continue
+
+            wf = json.loads(json.dumps(workflow))  # æ·±æ‹·è´æ¨¡æ¿
+            source_node = wf[xw_nodes["source_id"]]
+            source_node["inputs"]["root_dir"] = args.root
+            source_node["inputs"]["episode_index"] = idx
+            source_node["inputs"]["segment_mode"] = args.segment_mode
+            source_node["inputs"]["segment_index"] = seg_idx
+            source_node["inputs"]["script_file"] = args.script_file
+            source_node["inputs"]["image_pattern"] = args.image_pattern
+            compact_plan = json.dumps(
+                {k: v for k, v in plan.items() if k not in ("script", "episode_dir")},
+                ensure_ascii=False)
+            if xw_nodes["mode"] == "director":
+                source_node["inputs"]["max_images"] = args.max_images
+                source_node["inputs"]["plan"] = compact_plan
+            else:
+                loader_node = wf[xw_nodes["loader_id"]]
+                loader_node["inputs"]["max_images"] = args.max_images
+                if xw_nodes["planner_id"] is not None:
+                    planner_node = wf[xw_nodes["planner_id"]]
+                    planner_node["inputs"]["max_images"] = args.max_images
+                    planner_node["inputs"]["llm_api_base"] = args.llm_base
+                    planner_node["inputs"]["llm_api_key"] = args.llm_key
+                    planner_node["inputs"]["llm_model"] = args.llm_model
+                    planner_node["inputs"]["llm_vision"] = not args.no_vision
+                    planner_node["inputs"]["plan_override"] = compact_plan
+                else:
+                    loader_node["inputs"]["plan"] = compact_plan
+
+            used_slots = {int(s["slot"]) for s in plan.get("slots", [])}
+            log = []
+            cut_unused_slots(wf, xw_nodes["loader_id"], used_slots, log)
+            if log:
+                print("  å¿½ç•¥èŠ‚ç‚¹ï¼š\n    " + "\n    ".join(log))
+            else:
+                print("  æœ¬å•ä½æ— éœ€è¦å¿½ç•¥çš„èŠ‚ç‚¹")
+
+            try:
+                r = http_json("%s/prompt" % args.server,
+                              {"prompt": wf, "client_id": "xiangwriter-run-series"}, timeout=30)
+            except Exception as e:
+                print("  æ’é˜Ÿå¤±è´¥ï¼š%sï¼ˆè¯·ç¡®è®¤ ComfyUI å·²å¯åŠ¨åœ¨ %sï¼‰" % (e, args.server))
+                continue
+            pid = r["prompt_id"]
+            print("  å·²æ’é˜Ÿï¼š%s" % pid)
+            hist = poll(args.server, pid)
+            safe_name = unit_name.replace("/", "_").replace("\\", "_")
+            out_path = os.path.join(args.out, "%02d_%s_history.json" % (idx, safe_name))
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(hist, f, ensure_ascii=False, indent=2)
+            st = hist.get("status", {})
+            status = st.get("status_str") or ("completed" if st.get("completed") else "unknown")
+            print("  å®Œæˆï¼šstatus=%sï¼Œå†å²å·²å­˜ %s" % (status, out_path))
+
+    print("=" * 60)
+    print("å…¨éƒ¨å®Œæˆï¼Œç»“æœè§ %s" % args.out)
+
+
+if __name__ == "__main__":
+    main()
+éœ€åŒ…å« XWComicDirectorï¼Œæˆ–åŒæ—¶åŒ…å« XWSeriesSource + XWReferenceLoader)Úexist_oku   é”™è¯¯ï¼š%s ä¸‹æ²¡æœ‰é›†ç›®å½•)Úapi_baseÚapi_keyÚmodelÚvisionÚsystem_prompt)	Úroot_dirÚepisode_indexÚsegment_modeÚsegment_indexÚscript_fileÚimage_patternÚ
+max_imagesÚnodesÚllmÚ	unit_namez<============================================================z[%d/%d] %s | %sÚmessageÚoku     è·³è¿‡ï¼ˆ%sï¼‰r0   r>   r   r‚   rƒ   r„   r…   r†   )ÚscriptÚepisode_dirF)Úensure_asciir/   r.   r‡   Úplanr4   r2   Úllm_api_baseÚllm_api_keyÚ	llm_modelÚ
+llm_visionÚplan_overrideÚslotsrT   u     å¿½ç•¥èŠ‚ç‚¹ï¼š
+    z
+    u#     æœ¬å•ä½æ— éœ€è¦å¿½ç•¥çš„èŠ‚ç‚¹z	%s/promptzxiangwriter-run-series)ÚpromptÚ	client_idé   r   u     æ’é˜Ÿå¤±è´¥ï¼šu"   ï¼ˆè¯·ç¡®è®¤ ComfyUI å·²å¯åŠ¨åœ¨ u   ï¼‰rh   u     å·²æ’é˜Ÿï¼š%sÚ/Ú_Ú\z%02d_%s_history.jsonÚwr?   )r   Úindentr^   r`   r_   Úunknownu     å®Œæˆï¼šstatus=u   ï¼Œå†å²å·²å­˜ u   å…¨éƒ¨å®Œæˆï¼Œç»“æœè§ %s)3ÚargparseÚArgumentParserÚadd_argumentÚintÚosÚenvironr$   Ú
+parse_argsÚopenr&   r   Úloadr;   ÚprintÚsysÚexitÚmakedirsÚoutÚxw_agentÚfind_episode_dirsÚrootrD   ÚendrI   ÚstartÚmaxÚminÚpathÚbasenamerƒ   Úfind_segment_dirsÚ	enumerater…   r†   r‡   Úllm_baseÚllm_keyr“   Ú	no_visionÚ	run_agentr   r   r#   r[   Újoinr   rg   rd   rl   ÚreplaceÚdump)%ÚapÚargsÚfr&   Úxw_nodesÚep_dirsÚtotalr±   ÚidxÚep_dirÚep_nameÚunitsÚsegsÚiÚsÚunit_dirÚseg_idxÚcfgr   rŠ   ÚwfÚsource_nodeÚkrF   Úcompact_planÚloader_nodeÚplanner_noderQ   rR   r   ÚeÚpidÚhistÚ	safe_nameÚout_pathrk   r^   s%                                        r   ÚmainrÛ   ˆ   s  € Ü	×	 Ñ	 Ğ-PÔ	Q€BØ‡OOØ˜tØ_ğ ô ağ ‡OOH tĞ2C€OÔDØ‡OOI¤C°€OÔ3Ø‡OOG¤#¨q°z€OÔBØ‡OOĞ$¨\Øqğ ô sà‡OOO¨\€OÔ:Ø‡OOĞ%¨w€OÔ7Ø‡OON¬°a€OÔ8Ø‡OOL¬"¯*©*¯.©.¸ÈÓ*K€OÔLØ‡OOK¬¯©¯©¸ÀbÓ)I€OÔJØ‡OOM¬2¯:©:¯>©>¸.È"Ó+M€OÔNØ‡OOM¨,€OÔ7Ø‡OOJĞ(?€OÔ@Ø‡OOG YĞ5I€OÔJØ=‰=‹?€Dä	ˆdm‰m˜S¨7Õ	3°qÜ—9‘9˜Q“<ˆ÷ 
+4ä˜XÓ&€HØĞÜĞpÔqÜ‰Œä‡KK—‘ 4Õ(Ü×(Ñ(¨¯©Ó3€GÜ‹L€EØ‚zÜĞ.°·±Ñ:Ô;Ü‰ŒØ—h‘h ’lˆ$(Š(¨€CäT—Z‘Z  q¡×)ˆØœ˜Q¤ C¨!¡G¬S°«\¸AÑ-=Ó >Ó?Ñ@ˆÜ—'‘'×"Ñ" 6Ó*ˆğ ˆØ×ÒÜ×-Ñ-¨fÓ5ˆDÙ@D¬I°d¬OÔ<©O¡D A qa˜˜Q™’Z¨OÓ<ÈFĞTUÈ;È-‰Eà˜a[MˆEä!&ÑˆHgà ŸI™IØ!$Ø $× 1Ñ 1Ø!(Ø#×/Ñ/Ø!%×!3Ñ!3Ø"Ÿo™oØà $§¡Ø#Ÿ|™|Ø!Ÿ^™^Ø"&§.¡.Ğ0Ø%'ññˆCô" ×%Ñ% cÓ*ˆDØŸ™ Ó-Ò8°ˆIÜ(ŒOÜĞ# s¨E°9¸d¿h¹hÀyĞRTÓ>UĞ&VÑVÔWØ—8‘8˜D”>ÜĞ(¨4¯8©8°IÓ+>Ñ>Ô?Øä—‘œDŸJ™J xÓ0Ó1ˆBØ˜X kÑ2Ñ3ˆKØ04·	±	ˆK˜Ñ! *Ñ-Ø58ˆK˜Ñ! /Ñ2Ø48×4EÑ4EˆK˜Ñ! .Ñ1Ø5<ˆK˜Ñ! /Ñ2Ø37×3CÑ3CˆK˜Ñ! -Ñ0Ø59×5GÑ5GˆK˜Ñ! /Ñ2ÜŸ:™:Ø"&§*¡*¤,ÔU¡,™$˜!˜Q°!Ğ;TÒ2TA‘ ,ÒUØ"ô$ˆLğ ˜Ñ :Ò-Ø6:·o±o˜HÑ% lÑ3Ø0<˜HÑ% fÒ-à  ¨+Ñ!6Ñ7Ø6:·o±o˜HÑ% lÑ3Ø˜LÑ)Ğ5Ø#% h¨|Ñ&<Ñ#=LØ;?¿?¹?L Ñ*¨<Ñ8Ø=A¿]¹]L Ñ*¨>Ñ:Ø<@¿L¹LL Ñ*¨=Ñ9Ø:>¿.¹.L Ñ*¨;Ñ7Ø?C¿~¹~Ğ;ML Ñ*¨<Ñ8Ø>JL Ñ*¨?Ò;à4@K Ñ)¨&Ñ1à26·(±(¸7ÀBÔ2GÓHÑ2G¨Qœ#˜a ™i.Ğ2GˆJĞHØˆCÜ˜R ¨+Ñ!6¸
+ÀCÔHÙÜĞ/°(·-±-ÀÓ2DÑDÕEäĞ;Ô<ğÜ˜k¨D¯K©KÑ7Ø)+Ğ:RÑSĞ]_ôağ
+ K‘.ˆCÜĞ$ sÑ*Ô+Ü˜Ÿ™ SÓ)ˆDØ!×)Ñ)¨#¨sÓ3×;Ñ;¸DÀ#ÓFˆIÜ—w‘w—|‘| D§H¡HĞ.DÈÈYĞGWÑ.WÓXˆHÜh ¨gÕ6¸!Ü—	‘	˜$ °¸aÕ@÷ 7à—‘˜( BÓ'ˆBØ—V‘V˜LÓ)Ò`¸R¿V¹VÀKÔ=P©kĞV_ˆFİºfÁhĞOÖPò[ "'ğ *ôv 
+ˆ(„OÜ	Ğ
+'¨$¯(©(Ñ
+2Õ3÷W 
+4Ñ	3üó. =ùóN Vùò& Iøô ò İÒVWĞY]×YdÓYdĞeÔfİûğú÷ 7Ğ6úsH   Æ7]2Ì3]?Ó9^Ô^×^Ø5^Û_İ2]<Ş	_ Ş^;Ş;_ ß_Ú__main__)Nr™   )i  )Ú__doc__r    r   r¤   rª   rc   Úurllib.requestr   rµ   ÚdirnameÚabspathÚ__file__ÚHEREÚROOTÚinsertÚpyr   r®   r%   r7   r8   r9   rJ   r   r)   r,   r;   r[   rl   rÛ   Ú__name__© r*   r   Ú<module>rè      sÄ   ğñó Û Û 	Û 
+Û Û à	‡ww‡r—w‘w—‘ xÓ0Ó1€Ø	‡ww‡tÓ€Øˆsx‰xÑØ‡HH‡OOAtÔå  à"€Ø€Ø €Ø"€Ø€ó4òòòò*$óNCò @4ğF ˆzÒÙ…Fğ r*   

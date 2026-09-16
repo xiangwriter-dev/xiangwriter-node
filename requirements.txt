@@ -1,0 +1,1 @@
+# XiangWriter 无额外第三方依赖：仅使用 Python 标准库 + ComfyUI 自带的 Pillow / torch / aiohttp / typing_extensions。
